@@ -1,17 +1,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <readline/history.h>
 #include <readline/readline.h>
+#include "history.h"
 
 int main(void)
 {
+    char *line;
+
     printf("=====================================\n");
     printf("Shellforge\n");
     printf("A Unix Style Shell written in C\n");
     printf("=====================================\n");
-
-    char *line;
 
     while (1)
     {
@@ -29,8 +29,6 @@ int main(void)
             continue;
         }
 
-        add_history(line);
-
         if (strcmp(line, "exit") == 0)
         {
             free(line);
@@ -38,10 +36,21 @@ int main(void)
             break;
         }
 
+        if (strcmp(line, "history") == 0)
+        {
+            show_history();
+            free(line);
+            continue;
+        }
+
+        add_history_entry(line);
+
         printf("YOU ENTERED : %s\n", line);
 
         free(line);
     }
+
+    free_history();
 
     return 0;
 }
