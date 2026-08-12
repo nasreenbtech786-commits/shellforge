@@ -2,15 +2,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <readline/readline.h>
-#include "history.h"
+#include "lexer.h"
 
 int main(void)
 {
     char *line;
 
     printf("=====================================\n");
-    printf("Shellforge\n");
-    printf("A Unix Style Shell written in C\n");
+    printf("Shellforge - Milestone 2\n");
+    printf("Tokenizer and Lexer\n");
     printf("=====================================\n");
 
     while (1)
@@ -23,7 +23,7 @@ int main(void)
             break;
         }
 
-        if (strlen(line) == 0)
+        if (line[0] == '\0')
         {
             free(line);
             continue;
@@ -36,21 +36,10 @@ int main(void)
             break;
         }
 
-        if (strcmp(line, "history") == 0)
-        {
-            show_history();
-            free(line);
-            continue;
-        }
-
-        add_history_entry(line);
-
-        printf("YOU ENTERED : %s\n", line);
+        lexer(line);
 
         free(line);
     }
-
-    free_history();
 
     return 0;
 }
