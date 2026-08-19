@@ -8,14 +8,15 @@
 #include "parser.h"
 #include "expand.h"
 #include "builtin.h"
+#include "executor.h"
 
 int main(void)
 {
     char *line;
 
     printf("=====================================\n");
-    printf("Shellforge - Milestone 3.1\n");
-    printf("Built-in Commands\n");
+    printf("Shellforge - Milestone 3.2\n");
+    printf("External Command Execution\n");
     printf("=====================================\n");
 
     while (1)
@@ -55,22 +56,7 @@ int main(void)
 
         parser(expanded, &cmdline);
 
-        if (cmdline.count > 0 &&
-            cmdline.commands[0].argc > 0 &&
-            is_builtin(cmdline.commands[0].argv[0]))
-        {
-            int should_exit =
-                execute_builtin(cmdline.commands[0].argv);
-
-            free_command_line(&cmdline);
-            free(expanded);
-            free(line);
-
-            if (should_exit)
-                break;
-
-            continue;
-        }
+        execute_command_line(&cmdline);
 
         free_command_line(&cmdline);
         free(expanded);
@@ -81,5 +67,4 @@ int main(void)
 
     return 0;
 }
-
 
