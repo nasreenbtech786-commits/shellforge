@@ -18,5 +18,11 @@ typedef struct
     char *value;
 } Token;
 
+void tokenize(const char *input);
+void print_tokens(void);
+void free_tokens(void);
+
+const Token *get_tokens(int *count);
+
 #endif
 

@@ -160,3 +160,11 @@ void free_tokens(void)
     tokens = NULL;
     token_count = 0;
 }
+
+const Token *get_tokens(int *count)
+{
+    if (count != NULL)
+        *count = token_count;
+
+    return tokens;
+}
