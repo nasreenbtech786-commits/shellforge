@@ -7,14 +7,15 @@
 #include "history.h"
 #include "parser.h"
 #include "expand.h"
+#include "builtin.h"
 
 int main(void)
 {
     char *line;
 
     printf("=====================================\n");
-    printf("Shellforge - Milestone 2.2\n");
-    printf("Parser and Expand\n");
+    printf("Shellforge - Milestone 3.1\n");
+    printf("Built-in Commands\n");
     printf("=====================================\n");
 
     while (1)
@@ -23,7 +24,7 @@ int main(void)
 
         if (line == NULL)
         {
-            printf("\nGoodbye!\n");
+            printf("\n");
             break;
         }
 
@@ -31,13 +32,6 @@ int main(void)
         {
             free(line);
             continue;
-        }
-
-        if (strcmp(line, "exit") == 0)
-        {
-            free(line);
-            printf("Exiting...\n");
-            break;
         }
 
         if (strcmp(line, "history") == 0)
@@ -61,48 +55,24 @@ int main(void)
 
         parser(expanded, &cmdline);
 
-        printf("\n========== PARSED COMMAND ==========\n");
-
-        for (int i = 0; i < cmdline.count; i++)
+        if (cmdline.count > 0 &&
+            cmdline.commands[0].argc > 0 &&
+            is_builtin(cmdline.commands[0].argv[0]))
         {
-            Command *cmd = &cmdline.commands[i];
+            int should_exit =
+                execute_builtin(cmdline.commands[0].argv);
 
-            printf("Command %d:\n", i + 1);
+            free_command_line(&cmdline);
+            free(expanded);
+            free(line);
 
-            for (int j = 0; j < cmd->argc; j++)
-            {
-                printf("  argv[%d] = %s\n",
-                       j,
-                       cmd->argv[j]);
-            }
+            if (should_exit)
+                break;
 
-            if (cmd->input_file != NULL)
-            {
-                printf("  input  = %s\n",
-                       cmd->input_file);
-            }
-
-            if (cmd->output_file != NULL)
-            {
-                printf("  output = %s\n",
-                       cmd->output_file);
-
-                if (cmd->append)
-                    printf("  mode   = append\n");
-                else
-                    printf("  mode   = overwrite\n");
-            }
-
-            if (cmd->background)
-            {
-                printf("  background = yes\n");
-            }
+            continue;
         }
 
-        printf("====================================\n");
-
         free_command_line(&cmdline);
-
         free(expanded);
         free(line);
     }
@@ -111,4 +81,5 @@ int main(void)
 
     return 0;
 }
+
 
