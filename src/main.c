@@ -15,9 +15,15 @@ int main(void)
     char *line;
 
     printf("=====================================\n");
-    printf("Shellforge - Milestone 3.2\n");
-    printf("External Command Execution\n");
+    printf("Shellforge - Milestone 4.2\n");
+    printf("Background Process Execution\n");
     printf("=====================================\n");
+
+    /*
+     * Install SIGCHLD handler.
+     * This reaps completed background processes.
+     */
+    setup_background_handler();
 
     while (1)
     {

@@ -1,14 +1,65 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <errno.h>
+#include <string.h>
 
 #include "executor.h"
 #include "builtin.h"
 
 /*
- * Set up input/output redirection for a command.
+ * SIGCHLD handler.
+ *
+ * Background processes must be reaped when they finish.
+ * WNOHANG prevents the shell from being blocked.
+ */
+static void sigchld_handler(int sig)
+{
+    int saved_errno = errno;
+
+    (void)sig;
+
+    while (waitpid(-1, NULL, WNOHANG) > 0)
+    {
+        /*
+         * Reap all finished child processes.
+         */
+    }
+
+    errno = saved_errno;
+}
+
+/*
+ * Install the SIGCHLD handler.
+ */
+void setup_background_handler(void)
+{
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof(sa));
+
+    sa.sa_handler = sigchld_handler;
+    sigemptyset(&sa.sa_mask);
+
+    /*
+     * Restart interrupted system calls.
+     * Do not generate SIGCHLD for stopped children.
+     */
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+
+    if (sigaction(SIGCHLD, &sa, NULL) < 0)
+    {
+        perror("sigaction");
+    }
+}
+
+/*
+ * Set up input/output redirection.
  */
 static int setup_redirection(Command *cmd)
 {
@@ -63,20 +114,118 @@ static int setup_redirection(Command *cmd)
 }
 
 /*
- * Execute a pipeline of commands.
+ * Execute a single command.
  *
- * Example:
+ * Foreground command:
+ *     fork -> execute -> wait
  *
+ * Background command:
+ *     fork -> execute -> do not wait
+ */
+static void execute_single_command(Command *cmd)
+{
+    if (cmd == NULL || cmd->argc == 0)
+        return;
+
+    /*
+     * A foreground builtin must execute in the shell process.
+     *
+     * This is required for commands such as:
+     *
+     *     cd /tmp
+     */
+    if (!cmd->background &&
+        is_builtin(cmd->argv[0]) &&
+        cmd->input_file == NULL &&
+        cmd->output_file == NULL)
+    {
+        execute_builtin(cmd->argv);
+        return;
+    }
+
+    pid_t pid = fork();
+
+    if (pid < 0)
+    {
+        perror("fork");
+        return;
+    }
+
+    if (pid == 0)
+    {
+        /*
+         * CHILD PROCESS
+         */
+
+        if (setup_redirection(cmd) != 0)
+            _exit(EXIT_FAILURE);
+
+        /*
+         * Builtins executed in a child are allowed for
+         * background execution.
+         */
+        if (is_builtin(cmd->argv[0]))
+        {
+            int result = execute_builtin(cmd->argv);
+
+            _exit(result == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
+        }
+
+        /*
+         * External command.
+         */
+        execvp(cmd->argv[0], cmd->argv);
+
+        perror(cmd->argv[0]);
+        _exit(EXIT_FAILURE);
+    }
+
+    /*
+     * PARENT PROCESS
+     */
+
+    if (cmd->background)
+    {
+        /*
+         * Do not wait for a background process.
+         */
+        printf("[Background PID: %d]\n", pid);
+        fflush(stdout);
+        return;
+    }
+
+    /*
+     * Foreground command.
+     */
+    waitpid(pid, NULL, 0);
+}
+
+/*
+ * Execute a pipeline.
+ *
+ * Examples:
+ *
+ *     ls | grep src
  *     ls | grep src | wc -l
  *
- * Each command gets its own child process.
- * Pipes connect the stdout of one command
- * to the stdin of the next command.
+ * Background:
+ *
+ *     ls | grep src &
  */
 static void execute_pipeline(CommandLine *cmdline)
 {
     int previous_read = -1;
-    pid_t pids[MAX_COMMANDS];
+    pid_t pids[MAX_COMMANDS] = {0};
+
+    if (cmdline == NULL || cmdline->count == 0)
+        return;
+
+    /*
+     * A pipeline is considered background if the last
+     * command contains '&'.
+     */
+    int background =
+        cmdline->commands[cmdline->count - 1].background;
 
     for (int i = 0; i < cmdline->count; i++)
     {
@@ -95,18 +244,22 @@ static void execute_pipeline(CommandLine *cmdline)
             if (pipe(pipefd) < 0)
             {
                 perror("pipe");
+
+                if (previous_read != -1)
+                    close(previous_read);
+
                 return;
             }
         }
 
-        /*
-         * Create a child process for this command.
-         */
         pid_t pid = fork();
 
         if (pid < 0)
         {
             perror("fork");
+
+            if (previous_read != -1)
+                close(previous_read);
 
             if (pipefd[0] != -1)
                 close(pipefd[0]);
@@ -124,8 +277,8 @@ static void execute_pipeline(CommandLine *cmdline)
              */
 
             /*
-             * If this is not the first command,
-             * connect previous pipe's read end to stdin.
+             * Connect previous command's output
+             * to this command's input.
              */
             if (previous_read != -1)
             {
@@ -137,8 +290,8 @@ static void execute_pipeline(CommandLine *cmdline)
             }
 
             /*
-             * If this is not the last command,
-             * connect current pipe's write end to stdout.
+             * Connect this command's output
+             * to the next command.
              */
             if (pipefd[1] != -1)
             {
@@ -150,7 +303,7 @@ static void execute_pipeline(CommandLine *cmdline)
             }
 
             /*
-             * Close file descriptors that are no longer needed.
+             * Close unused descriptors.
              */
             if (previous_read != -1)
                 close(previous_read);
@@ -162,14 +315,13 @@ static void execute_pipeline(CommandLine *cmdline)
                 close(pipefd[1]);
 
             /*
-             * Apply normal input/output redirection.
+             * Apply redirection.
              */
             if (setup_redirection(cmd) != 0)
                 _exit(EXIT_FAILURE);
 
             /*
-             * Builtin commands inside a pipeline
-             * execute in the child process.
+             * Builtins inside a pipeline run in the child.
              */
             if (is_builtin(cmd->argv[0]))
             {
@@ -183,9 +335,6 @@ static void execute_pipeline(CommandLine *cmdline)
              */
             execvp(cmd->argv[0], cmd->argv);
 
-            /*
-             * execvp() returns only when an error occurs.
-             */
             perror(cmd->argv[0]);
             _exit(EXIT_FAILURE);
         }
@@ -197,39 +346,54 @@ static void execute_pipeline(CommandLine *cmdline)
         pids[i] = pid;
 
         /*
-         * The parent no longer needs the previous
-         * pipe's read end.
+         * Parent no longer needs previous read end.
          */
         if (previous_read != -1)
             close(previous_read);
 
         /*
-         * The parent does not write into the pipe.
+         * Parent does not write to the pipe.
          */
         if (pipefd[1] != -1)
             close(pipefd[1]);
 
         /*
-         * Keep the current pipe's read end.
-         * It becomes stdin for the next command.
+         * Keep read end for next command.
          */
         previous_read = pipefd[0];
 
-        /*
-         * For the last command there is no next pipe.
-         */
         if (i == cmdline->count - 1)
             previous_read = -1;
     }
 
     /*
-     * Close any remaining pipe descriptor.
+     * Close any remaining descriptor.
      */
     if (previous_read != -1)
         close(previous_read);
 
     /*
-     * Wait for all child processes.
+     * Background pipeline:
+     *
+     * Do NOT wait.
+     * SIGCHLD handler will reap children.
+     */
+    if (background)
+    {
+        /*
+         * Print the PID of the last process in the pipeline.
+         */
+        pid_t last_pid = pids[cmdline->count - 1];
+
+        printf("[Background Pipeline PID: %d]\n", last_pid);
+        fflush(stdout);
+
+        return;
+    }
+
+    /*
+     * Foreground pipeline:
+     * wait for every process.
      */
     for (int i = 0; i < cmdline->count; i++)
     {
@@ -247,33 +411,23 @@ void execute_command_line(CommandLine *cmdline)
         return;
 
     /*
-     * A single builtin without redirection
-     * must execute in the parent process.
+     * Single command.
      *
-     * This is important for commands such as:
+     * This also handles:
      *
+     *     sleep 5 &
+     *     echo hello &
      *     cd /tmp
-     *
-     * because changing directory inside a child
-     * would not change the shell's directory.
      */
     if (cmdline->count == 1)
     {
-        Command *cmd = &cmdline->commands[0];
-
-        if (cmd->argc > 0 &&
-            is_builtin(cmd->argv[0]) &&
-            cmd->input_file == NULL &&
-            cmd->output_file == NULL)
-        {
-            execute_builtin(cmd->argv);
-            return;
-        }
+        execute_single_command(&cmdline->commands[0]);
+        return;
     }
 
     /*
-     * Otherwise execute the command line as a pipeline.
+     * Multiple commands connected with pipes.
      */
     execute_pipeline(cmdline);
-
 }
+

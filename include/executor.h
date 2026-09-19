@@ -5,4 +5,7 @@
 
 void execute_command_line(CommandLine *cmdline);
 
+void setup_background_handler(void);
+
 #endif
+
