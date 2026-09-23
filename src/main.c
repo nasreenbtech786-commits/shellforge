@@ -9,24 +9,41 @@
 #include "expand.h"
 #include "builtin.h"
 #include "executor.h"
+#include "jobs.h"
 
 int main(void)
 {
     char *line;
 
     printf("=====================================\n");
-    printf("Shellforge - Milestone 4.2\n");
-    printf("Background Process Execution\n");
+    printf("Shellforge - Milestone 5.1\n");
+    printf("Job Control: jobs, fg and bg\n");
     printf("=====================================\n");
 
     /*
+     * Initialize the job table.
+     */
+    jobs_init();
+
+    /*
+     * Initialize shell process group,
+     * terminal control and signal handling.
+     */
+    setup_job_control();
+
+    /*
      * Install SIGCHLD handler.
-     * This reaps completed background processes.
      */
     setup_background_handler();
 
     while (1)
     {
+        /*
+         * Reap completed background jobs
+         * before displaying the next prompt.
+         */
+        reap_background_jobs();
+
         line = readline("shellforge$ ");
 
         if (line == NULL)
@@ -41,6 +58,9 @@ int main(void)
             continue;
         }
 
+        /*
+         * History command.
+         */
         if (strcmp(line, "history") == 0)
         {
             show_history();
@@ -48,8 +68,14 @@ int main(void)
             continue;
         }
 
+        /*
+         * Store command in history.
+         */
         add_history_entry(line);
 
+        /*
+         * Expand environment variables.
+         */
         char *expanded = expand_variables(line);
 
         if (expanded == NULL)
@@ -58,17 +84,30 @@ int main(void)
             continue;
         }
 
+        /*
+         * Parse command.
+         */
         CommandLine cmdline = {0};
 
         parser(expanded, &cmdline);
 
+        /*
+         * Execute command.
+         */
         execute_command_line(&cmdline);
 
+        /*
+         * Free parser memory.
+         */
         free_command_line(&cmdline);
+
         free(expanded);
         free(line);
     }
 
+    /*
+     * Clean up history.
+     */
     free_history();
 
     return 0;

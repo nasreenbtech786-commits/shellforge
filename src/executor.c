@@ -4,38 +4,76 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/types.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <errno.h>
 #include <string.h>
+#include <termios.h>
 
 #include "executor.h"
 #include "builtin.h"
+#include "jobs.h"
+
+static pid_t shell_pgid;
+static struct termios shell_tmodes;
+
+static volatile sig_atomic_t child_event = 0;
 
 /*
  * SIGCHLD handler.
  *
- * Background processes must be reaped when they finish.
- * WNOHANG prevents the shell from being blocked.
+ * Only set a flag here.
+ * Job-table operations are performed outside
+ * the signal handler.
  */
 static void sigchld_handler(int sig)
 {
-    int saved_errno = errno;
-
     (void)sig;
 
-    while (waitpid(-1, NULL, WNOHANG) > 0)
-    {
-        /*
-         * Reap all finished child processes.
-         */
-    }
-
-    errno = saved_errno;
+    child_event = 1;
 }
 
 /*
- * Install the SIGCHLD handler.
+ * Initialize interactive job control.
+ */
+void setup_job_control(void)
+{
+    shell_pgid = getpid();
+
+    /*
+     * Shell ignores interactive terminal signals.
+     */
+    signal(SIGINT, SIG_IGN);
+    signal(SIGQUIT, SIG_IGN);
+    signal(SIGTSTP, SIG_IGN);
+    signal(SIGTTIN, SIG_IGN);
+    signal(SIGTTOU, SIG_IGN);
+
+    /*
+     * Put ShellForge into its own process group.
+     */
+    if (setpgid(shell_pgid, shell_pgid) < 0)
+    {
+        if (errno != EPERM)
+            perror("setpgid");
+    }
+
+    /*
+     * Give terminal control to ShellForge.
+     */
+    if (tcsetpgrp(STDIN_FILENO, shell_pgid) < 0)
+        perror("tcsetpgrp");
+
+    /*
+     * Save terminal settings.
+     */
+    if (tcgetattr(STDIN_FILENO, &shell_tmodes) < 0)
+        perror("tcgetattr");
+}
+
+/*
+ * Install SIGCHLD handler.
  */
 void setup_background_handler(void)
 {
@@ -47,15 +85,13 @@ void setup_background_handler(void)
     sigemptyset(&sa.sa_mask);
 
     /*
-     * Restart interrupted system calls.
-     * Do not generate SIGCHLD for stopped children.
+     * Do not use SA_NOCLDSTOP because Ctrl+Z
+     * must generate SIGCHLD.
      */
-    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    sa.sa_flags = SA_RESTART;
 
     if (sigaction(SIGCHLD, &sa, NULL) < 0)
-    {
         perror("sigaction");
-    }
 }
 
 /*
@@ -114,13 +150,163 @@ static int setup_redirection(Command *cmd)
 }
 
 /*
+ * Give terminal control to a process group.
+ */
+static void give_terminal_to(pid_t pgid)
+{
+    if (tcsetpgrp(STDIN_FILENO, pgid) < 0)
+        perror("tcsetpgrp");
+}
+
+/*
+ * Return terminal control to ShellForge.
+ */
+static void return_terminal_to_shell(void)
+{
+    if (tcsetpgrp(STDIN_FILENO, shell_pgid) < 0)
+        perror("tcsetpgrp");
+
+    if (tcgetattr(STDIN_FILENO, &shell_tmodes) < 0)
+        perror("tcgetattr");
+}
+
+/*
+ * Wait for a foreground process group.
+ *
+ * WUNTRACED allows Ctrl+Z to be detected.
+ */
+static void wait_for_foreground_job(pid_t pgid, int job_id)
+{
+    int status;
+    pid_t pid;
+
+    while (1)
+    {
+        pid = waitpid(-pgid, &status, WUNTRACED);
+
+        if (pid < 0)
+        {
+            if (errno == EINTR)
+                continue;
+
+            if (errno == ECHILD)
+                break;
+
+            perror("waitpid");
+            break;
+        }
+
+        /*
+         * Ctrl+Z stopped the foreground process group.
+         */
+        if (WIFSTOPPED(status))
+        {
+            if (job_id > 0)
+                job_stop(job_id);
+
+            break;
+        }
+
+        /*
+         * One process in the group finished.
+         *
+         * Continue waiting because a pipeline may
+         * contain multiple processes.
+         */
+        if (WIFEXITED(status) || WIFSIGNALED(status))
+            continue;
+    }
+
+    /*
+     * Give terminal back to ShellForge.
+     */
+    return_terminal_to_shell();
+}
+
+/*
+ * Reap completed background jobs.
+ *
+ * Jobs are checked by process-group ID rather than
+ * calling getpgid() on a child after it has already
+ * been reaped.
+ */
+void reap_background_jobs(void)
+{
+    int i;
+
+    if (!child_event)
+        return;
+
+    child_event = 0;
+
+    for (i = 1; i <= MAX_JOBS; i++)
+    {
+        Job *job = job_find(i);
+
+        if (job == NULL)
+            continue;
+
+        if (job->pgid <= 0)
+            continue;
+
+        while (1)
+        {
+            int status;
+            pid_t result;
+
+            result = waitpid(
+                -job->pgid,
+                &status,
+                WNOHANG | WUNTRACED
+            );
+
+            if (result == 0)
+            {
+                /*
+                 * Processes are still running.
+                 */
+                break;
+            }
+
+            if (result < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+
+                if (errno == ECHILD)
+                {
+                    /*
+                     * No processes remain in this job.
+                     */
+                    if (job->state != JOB_STOPPED)
+                        job->state = JOB_DONE;
+
+                    break;
+                }
+
+                break;
+            }
+
+            if (WIFSTOPPED(status))
+            {
+                job->state = JOB_STOPPED;
+                break;
+            }
+
+            if (WIFEXITED(status) || WIFSIGNALED(status))
+            {
+                /*
+                 * There may be more processes in a pipeline.
+                 * Continue checking the process group.
+                 */
+                continue;
+            }
+        }
+    }
+}
+
+/*
  * Execute a single command.
- *
- * Foreground command:
- *     fork -> execute -> wait
- *
- * Background command:
- *     fork -> execute -> do not wait
  */
 static void execute_single_command(Command *cmd)
 {
@@ -128,11 +314,8 @@ static void execute_single_command(Command *cmd)
         return;
 
     /*
-     * A foreground builtin must execute in the shell process.
-     *
-     * This is required for commands such as:
-     *
-     *     cd /tmp
+     * Foreground builtins execute directly
+     * inside the shell.
      */
     if (!cmd->background &&
         is_builtin(cmd->argv[0]) &&
@@ -157,12 +340,29 @@ static void execute_single_command(Command *cmd)
          * CHILD PROCESS
          */
 
+        /*
+         * Create a new process group.
+         */
+        if (setpgid(0, 0) < 0)
+            perror("setpgid");
+
+        /*
+         * Restore normal terminal signals.
+         */
+        signal(SIGINT, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGTSTP, SIG_DFL);
+        signal(SIGTTIN, SIG_DFL);
+        signal(SIGTTOU, SIG_DFL);
+
+        /*
+         * Apply redirection.
+         */
         if (setup_redirection(cmd) != 0)
             _exit(EXIT_FAILURE);
 
         /*
-         * Builtins executed in a child are allowed for
-         * background execution.
+         * Builtin executed in child.
          */
         if (is_builtin(cmd->argv[0]))
         {
@@ -172,7 +372,7 @@ static void execute_single_command(Command *cmd)
         }
 
         /*
-         * External command.
+         * Execute external command.
          */
         execvp(cmd->argv[0], cmd->argv);
 
@@ -184,49 +384,94 @@ static void execute_single_command(Command *cmd)
      * PARENT PROCESS
      */
 
+    /*
+     * Put child into its own process group.
+     */
+    if (setpgid(pid, pid) < 0)
+    {
+        if (errno != EACCES && errno != ESRCH)
+            perror("setpgid");
+    }
+
+    /*
+     * BACKGROUND COMMAND
+     */
     if (cmd->background)
     {
-        /*
-         * Do not wait for a background process.
-         */
-        printf("[Background PID: %d]\n", pid);
-        fflush(stdout);
+        int job_id = job_add(
+            pid,
+            JOB_RUNNING,
+            cmd->argv[0]
+        );
+
+        if (job_id > 0)
+        {
+            printf("[%d] %d\n", job_id, pid);
+            fflush(stdout);
+        }
+
         return;
     }
 
     /*
-     * Foreground command.
+     * FOREGROUND COMMAND
+     *
+     * Register it so Ctrl+Z can mark it STOPPED.
      */
-    waitpid(pid, NULL, 0);
+    int job_id = job_add(
+        pid,
+        JOB_RUNNING,
+        cmd->argv[0]
+    );
+
+    /*
+     * Give terminal to foreground process.
+     */
+    give_terminal_to(pid);
+
+    /*
+     * Wait for foreground process.
+     */
+    wait_for_foreground_job(pid, job_id);
+
+    /*
+     * Keep stopped jobs.
+     * Remove completed jobs.
+     */
+    Job *job = job_find(job_id);
+
+    if (job != NULL && job->state != JOB_STOPPED)
+    {
+        job_remove(job_id);
+    }
 }
 
 /*
  * Execute a pipeline.
  *
- * Examples:
+ * Every process in the pipeline belongs to
+ * the same process group.
  *
- *     ls | grep src
- *     ls | grep src | wc -l
- *
- * Background:
- *
- *     ls | grep src &
+ * Therefore a pipeline is treated as ONE job.
  */
 static void execute_pipeline(CommandLine *cmdline)
 {
     int previous_read = -1;
-    pid_t pids[MAX_COMMANDS] = {0};
+    pid_t pgid = 0;
 
     if (cmdline == NULL || cmdline->count == 0)
         return;
 
     /*
-     * A pipeline is considered background if the last
-     * command contains '&'.
+     * The final command determines whether
+     * the complete pipeline runs in background.
      */
     int background =
         cmdline->commands[cmdline->count - 1].background;
 
+    /*
+     * Create every process in the pipeline.
+     */
     for (int i = 0; i < cmdline->count; i++)
     {
         Command *cmd = &cmdline->commands[i];
@@ -237,7 +482,7 @@ static void execute_pipeline(CommandLine *cmdline)
         int pipefd[2] = {-1, -1};
 
         /*
-         * Create a pipe unless this is the last command.
+         * Create pipe except for final command.
          */
         if (i < cmdline->count - 1)
         {
@@ -277,8 +522,33 @@ static void execute_pipeline(CommandLine *cmdline)
              */
 
             /*
-             * Connect previous command's output
-             * to this command's input.
+             * First process becomes process-group leader.
+             */
+            if (pgid == 0)
+            {
+                if (setpgid(0, 0) < 0)
+                    perror("setpgid");
+            }
+            else
+            {
+                /*
+                 * Remaining processes join the same group.
+                 */
+                if (setpgid(0, pgid) < 0)
+                    perror("setpgid");
+            }
+
+            /*
+             * Restore normal terminal signals.
+             */
+            signal(SIGINT, SIG_DFL);
+            signal(SIGQUIT, SIG_DFL);
+            signal(SIGTSTP, SIG_DFL);
+            signal(SIGTTIN, SIG_DFL);
+            signal(SIGTTOU, SIG_DFL);
+
+            /*
+             * Previous command -> stdin.
              */
             if (previous_read != -1)
             {
@@ -290,8 +560,7 @@ static void execute_pipeline(CommandLine *cmdline)
             }
 
             /*
-             * Connect this command's output
-             * to the next command.
+             * Current command -> next command.
              */
             if (pipefd[1] != -1)
             {
@@ -321,7 +590,7 @@ static void execute_pipeline(CommandLine *cmdline)
                 _exit(EXIT_FAILURE);
 
             /*
-             * Builtins inside a pipeline run in the child.
+             * Builtin inside pipeline.
              */
             if (is_builtin(cmd->argv[0]))
             {
@@ -343,7 +612,20 @@ static void execute_pipeline(CommandLine *cmdline)
          * PARENT PROCESS
          */
 
-        pids[i] = pid;
+        /*
+         * First child becomes process-group ID.
+         */
+        if (pgid == 0)
+            pgid = pid;
+
+        /*
+         * Parent also places child in process group.
+         */
+        if (setpgid(pid, pgid) < 0)
+        {
+            if (errno != EACCES && errno != ESRCH)
+                perror("setpgid");
+        }
 
         /*
          * Parent no longer needs previous read end.
@@ -352,13 +634,13 @@ static void execute_pipeline(CommandLine *cmdline)
             close(previous_read);
 
         /*
-         * Parent does not write to the pipe.
+         * Parent never writes into pipe.
          */
         if (pipefd[1] != -1)
             close(pipefd[1]);
 
         /*
-         * Keep read end for next command.
+         * Save read end for next command.
          */
         previous_read = pipefd[0];
 
@@ -367,38 +649,63 @@ static void execute_pipeline(CommandLine *cmdline)
     }
 
     /*
-     * Close any remaining descriptor.
+     * Close remaining descriptor.
      */
     if (previous_read != -1)
         close(previous_read);
 
     /*
-     * Background pipeline:
+     * BACKGROUND PIPELINE
      *
-     * Do NOT wait.
-     * SIGCHLD handler will reap children.
+     * Entire pipeline is one job.
      */
     if (background)
     {
-        /*
-         * Print the PID of the last process in the pipeline.
-         */
-        pid_t last_pid = pids[cmdline->count - 1];
+        int job_id = job_add(
+            pgid,
+            JOB_RUNNING,
+            cmdline->commands[0].argv[0]
+        );
 
-        printf("[Background Pipeline PID: %d]\n", last_pid);
-        fflush(stdout);
+        if (job_id > 0)
+        {
+            printf("[%d] %d\n", job_id, pgid);
+            fflush(stdout);
+        }
 
         return;
     }
 
     /*
-     * Foreground pipeline:
-     * wait for every process.
+     * FOREGROUND PIPELINE
+     *
+     * Entire pipeline is one job.
      */
-    for (int i = 0; i < cmdline->count; i++)
+    int job_id = job_add(
+        pgid,
+        JOB_RUNNING,
+        cmdline->commands[0].argv[0]
+    );
+
+    /*
+     * Give terminal to entire pipeline.
+     */
+    give_terminal_to(pgid);
+
+    /*
+     * Wait for entire foreground pipeline.
+     */
+    wait_for_foreground_job(pgid, job_id);
+
+    /*
+     * Keep stopped jobs.
+     * Remove completed jobs.
+     */
+    Job *job = job_find(job_id);
+
+    if (job != NULL && job->state != JOB_STOPPED)
     {
-        if (pids[i] > 0)
-            waitpid(pids[i], NULL, 0);
+        job_remove(job_id);
     }
 }
 
@@ -412,12 +719,6 @@ void execute_command_line(CommandLine *cmdline)
 
     /*
      * Single command.
-     *
-     * This also handles:
-     *
-     *     sleep 5 &
-     *     echo hello &
-     *     cd /tmp
      */
     if (cmdline->count == 1)
     {
@@ -426,7 +727,7 @@ void execute_command_line(CommandLine *cmdline)
     }
 
     /*
-     * Multiple commands connected with pipes.
+     * Multiple commands connected by pipes.
      */
     execute_pipeline(cmdline);
 }
